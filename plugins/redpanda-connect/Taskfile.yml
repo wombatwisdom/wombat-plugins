@@ -1,0 +1,19 @@
+  version: '3'
+
+  includes:
+    internal:
+      taskfile: ../../internal.yml
+      dir: ../..
+      internal: true
+
+  tasks:
+    build:
+      vars:
+        PACKAGES: amqp09,avro,aws
+        LIBRARY: redpanda-connect
+      cmds:
+        - for: { var: PACKAGES, split: ',', as: PKG }
+          task: internal:build_pkg
+          vars:
+            PACKAGE: "{{.PKG}}"
+            LIBRARY: "{{.LIBRARY}}"
