@@ -8,8 +8,15 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/redpanda-data/benthos/v4/public/service"
 	"sync"
+	"time"
 
 	"github.com/Jeffail/shutdown"
+)
+
+const (
+	natsFieldMessageDedupeID = "msg_id"
+	natsFieldAckWait         = "ack_wait"
+	natsFieldBatching        = "batching"
 )
 
 func natsJetStreamOutputConfig() *service.ConfigSpec {
@@ -36,27 +43,36 @@ func natsJetStreamOutputConfig() *service.ConfigSpec {
 			Description("Determine which (if any) metadata values should be added to messages as headers.").
 			Optional()).
 		Field(service.NewOutputMaxInFlightField().Default(1024)).
+		Fields(
+			service.NewInterpolatedStringField(natsFieldMessageDedupeID).
+				Description("An optional deduplication ID to set for messages.").
+				Optional(),
+		).
+		Field(service.NewDurationField(natsFieldAckWait).
+			Description("Maximum time to wait for receiving publish acknowledgements.").
+			Default("2s").
+			Optional()).
+		Fields(service.NewBatchPolicyField(natsFieldBatching)).
 		Fields(connectionTailFields()...).
 		Fields(outputTracingDocs())
 }
 
 func init() {
-	err := service.RegisterOutput(
+	err := service.RegisterBatchOutput(
 		"jetstream_stream", natsJetStreamOutputConfig(),
-		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Output, int, error) {
-			maxInFlight, err := conf.FieldInt("max_in_flight")
-			if err != nil {
-				return nil, 0, err
+		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.BatchOutput, batchPolicy service.BatchPolicy, maxInFlight int, err error) {
+			if maxInFlight, err = conf.FieldInt("max_in_flight"); err != nil {
+				return
 			}
-			w, err := newJetStreamWriterFromConfig(conf, mgr)
-			if err != nil {
-				return nil, 0, err
+			if batchPolicy, err = conf.FieldBatchPolicy(natsFieldBatching); err != nil {
+				return
 			}
-			spanOutput, err := conf.WrapOutputExtractTracingSpanMapping("jetstream_stream", w)
-			if err != nil {
-				return nil, 0, err
+			var w *jetStreamOutput
+			if w, err = newJetStreamWriterFromConfig(conf, mgr); err != nil {
+				return
 			}
-			return spanOutput, maxInFlight, err
+			out, err = conf.WrapBatchOutputExtractTracingSpanMapping("jetstream_stream", w)
+			return
 		})
 	if err != nil {
 		panic(err)
@@ -66,11 +82,13 @@ func init() {
 //------------------------------------------------------------------------------
 
 type jetStreamOutput struct {
-	connDetails   connectionDetails
-	subjectStrRaw string
-	subjectStr    *service.InterpolatedString
-	headers       map[string]*service.InterpolatedString
-	metaFilter    *service.MetadataFilter
+	connDetails            connectionDetails
+	subjectStrRaw          string
+	subjectStr             *service.InterpolatedString
+	headers                map[string]*service.InterpolatedString
+	metaFilter             *service.MetadataFilter
+	messageDeduplicationID *service.InterpolatedString
+	ackWait                time.Duration
 
 	log *service.Logger
 
@@ -114,6 +132,17 @@ func newJetStreamWriterFromConfig(conf *service.ParsedConfig, mgr *service.Resou
 			return nil, err
 		}
 	}
+
+	if conf.Contains(natsFieldMessageDedupeID) {
+		if j.messageDeduplicationID, err = conf.FieldInterpolatedString(natsFieldMessageDedupeID); err != nil {
+			return nil, err
+		}
+	}
+
+	if j.ackWait, err = conf.FieldDuration(natsFieldAckWait); err != nil {
+		return nil, err
+	}
+
 	return &j, nil
 }
 
@@ -162,7 +191,7 @@ func (j *jetStreamOutput) disconnect() {
 
 //------------------------------------------------------------------------------
 
-func (j *jetStreamOutput) Write(ctx context.Context, msg *service.Message) error {
+func (j *jetStreamOutput) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
 	j.connMut.Lock()
 	js := j.js
 	j.connMut.Unlock()
@@ -170,33 +199,52 @@ func (j *jetStreamOutput) Write(ctx context.Context, msg *service.Message) error
 		return service.ErrNotConnected
 	}
 
-	subject, err := j.subjectStr.TryString(msg)
-	if err != nil {
-		return fmt.Errorf(`failed string interpolation on field "subject": %w`, err)
-	}
-
-	jsmsg := nats.NewMsg(subject)
-	msgBytes, err := msg.AsBytes()
-	if err != nil {
-		return err
-	}
-
-	jsmsg.Data = msgBytes
-	for k, v := range j.headers {
-		value, err := v.TryString(msg)
+	for i, msg := range batch {
+		subject, err := j.subjectStr.TryString(msg)
 		if err != nil {
-			return fmt.Errorf(`failed string interpolation on header %q: %w`, k, err)
+			return fmt.Errorf(`failed string interpolation on field "subject": %w`, err)
 		}
 
-		jsmsg.Header.Add(k, value)
-	}
-	_ = j.metaFilter.Walk(msg, func(key, value string) error {
-		jsmsg.Header.Add(key, value)
-		return nil
-	})
+		var dedupeID string
+		if j.messageDeduplicationID != nil {
+			dedupeID, err = batch.TryInterpolatedString(i, j.messageDeduplicationID)
+			if err != nil {
+				return fmt.Errorf("dedupe id interpolation: %w", err)
+			}
+		}
 
-	_, err = js.PublishMsg(ctx, jsmsg)
-	return err
+		jsmsg := nats.NewMsg(subject)
+		msgBytes, err := msg.AsBytes()
+		if err != nil {
+			return err
+		}
+
+		jsmsg.Data = msgBytes
+		for k, v := range j.headers {
+			value, err := v.TryString(msg)
+			if err != nil {
+				return fmt.Errorf(`failed string interpolation on header %q: %w`, k, err)
+			}
+
+			jsmsg.Header.Add(k, value)
+		}
+		_ = j.metaFilter.Walk(msg, func(key, value string) error {
+			jsmsg.Header.Add(key, value)
+			return nil
+		})
+
+		_, err = js.PublishMsgAsync(jsmsg, jetstream.WithMsgID(dedupeID))
+		if err != nil {
+			return err
+		}
+	}
+
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(j.ackWait):
+		return fmt.Errorf("publish took too long")
+	}
+	return nil
 }
 
 func (j *jetStreamOutput) Close(ctx context.Context) error {
